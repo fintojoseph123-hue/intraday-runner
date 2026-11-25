@@ -1,0 +1,59 @@
+name: intraday-runner
+# Launcher only. This repo is public so GitHub Actions minutes are free and unlimited; it holds NO strategy data.
+# It checks out the private repo with a token, runs the alert engine in a loop until 15:32 IST, and pushes the Excel/state back to the private repo.
+# Several cron entries are listed because GitHub often starts scheduled runs late: the first one to start does the day's work, later ones exit at once.
+on:
+  schedule:
+    - cron: "35,50 3 * * 1-5"
+    - cron: "5,20,35,50 4 * * 1-5"
+    - cron: "5,35 5 * * 1-5"
+  workflow_dispatch:
+concurrency:
+  group: intraday-runner
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 400
+    steps:
+      - name: Check the time
+        id: t
+        run: |
+          END=$(TZ=Asia/Kolkata date -d "today 15:32" +%s)
+          if [ "$(date +%s)" -ge "$END" ]; then echo "go=no" >> "$GITHUB_OUTPUT"; else echo "go=yes" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/checkout@v4
+        if: steps.t.outputs.go == 'yes'
+        with:
+          repository: fintojoseph123-hue/nifty-btst-hub
+          token: ${{ secrets.HUB_TOKEN }}
+          path: hub
+      - uses: actions/setup-python@v5
+        if: steps.t.outputs.go == 'yes'
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: hub/intraday/requirements.txt
+      - name: Install packages
+        if: steps.t.outputs.go == 'yes'
+        run: pip install -q -r hub/intraday/requirements.txt > /dev/null 2>&1
+      - name: Run the alert engine until 15:32 IST - output is not printed because this repo is public
+        if: steps.t.outputs.go == 'yes'
+        working-directory: hub
+        env:
+          INTRADAY_TG_TOKEN: ${{ secrets.INTRADAY_TG_TOKEN }}
+          INTRADAY_TG_CHAT_ID: ${{ secrets.INTRADAY_TG_CHAT_ID }}
+        run: |
+          git config user.name "intraday-alerts"
+          git config user.email "intraday-alerts@users.noreply.github.com"
+          END=$(TZ=Asia/Kolkata date -d "today 15:32" +%s); START=$(date +%s)
+          while [ "$(date +%s)" -lt "$END" ] && [ $(( $(date +%s) - START )) -lt 23400 ]; do
+            timeout 150 python intraday/live/engine.py > /dev/null 2>&1 || true
+            for f in "output/INTRADAY ALERTS LOG.xlsx" intraday/state/day.json intraday/state/market.json intraday/state/premium.json intraday/data/premium intraday/data/context; do [ -e "$f" ] && git add -f "$f" > /dev/null 2>&1; done
+            if ! git diff --cached --quiet; then
+              git commit -q -m "intraday alerts: log update [skip ci]" > /dev/null 2>&1
+              (git pull --rebase -q origin main && git push -q origin HEAD:main) > /dev/null 2>&1 || true
+            fi
+            sleep 240
+          done
